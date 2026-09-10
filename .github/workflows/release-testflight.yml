@@ -1,0 +1,139 @@
+name: Release to TestFlight
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - "Sources/**"
+      - "Resources/**"
+      - "project.yml"
+      - ".github/workflows/release-testflight.yml"
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Same reasoning as build-ios.yml: pick the newest installed Xcode so XcodeGen's
+      # generated project format matches what's actually on the runner.
+      - name: Select latest available Xcode
+        run: |
+          LATEST_XCODE=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          echo "Seçilen Xcode: $LATEST_XCODE"
+          sudo xcode-select -s "$LATEST_XCODE/Contents/Developer"
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Set up App Store Connect API key
+        env:
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          set -e
+          mkdir -p "$HOME/private_keys"
+          printf '%s' "$ASC_API_KEY_P8" > "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+
+      - name: Set up temporary keychain
+        run: |
+          security create-keychain -p "" build.keychain
+          security list-keychains -d user -s build.keychain login.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+
+      # xcodebuild's automatic signing can create a brand-new certificate via the API, but it
+      # will never auto-revoke an existing one — every fresh runner has an empty keychain, so
+      # each run either leaves an orphaned certificate behind or fails outright with "already
+      # has a certificate for this machine, but its private key is not installed". The fix
+      # (same one fastlane match uses) is to stop asking Xcode to create certificates at all:
+      # import one persistent Development + Distribution certificate/key pair every run, so a
+      # matching private key is always already present and automatic signing only has to manage
+      # provisioning profiles.
+      - name: Import signing certificates
+        env:
+          CERT_DEV_P12_BASE64: ${{ secrets.CERT_DEV_P12_BASE64 }}
+          CERT_DIST_P12_BASE64: ${{ secrets.CERT_DIST_P12_BASE64 }}
+          CERT_P12_PASSWORD: ${{ secrets.CERT_P12_PASSWORD }}
+        run: |
+          set -e
+          # Secrets pasted via a text editor can pick up a trailing newline, which would make
+          # the password/base64 string not byte-match what openssl actually used — strip any
+          # trailing whitespace defensively so copy-paste doesn't silently break the import.
+          P12_PASSWORD=$(printf '%s' "$CERT_P12_PASSWORD" | tr -d '[:space:]')
+          printf '%s' "$CERT_DEV_P12_BASE64" | tr -d '[:space:]' | base64 --decode > dev.p12
+          printf '%s' "$CERT_DIST_P12_BASE64" | tr -d '[:space:]' | base64 --decode > dist.p12
+          security import dev.p12 -k build.keychain -P "$P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security import dist.p12 -k build.keychain -P "$P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain
+          rm -f dev.p12 dist.p12
+
+      # -allowProvisioningUpdates is the whole point here: with a real App Store Connect API
+      # key, xcodebuild does exactly what interactive Xcode's automatic signing does — creates/
+      # updates the App ID and the provisioning profile for the app.
+      - name: Archive (automatic signing)
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          xcodebuild \
+            -project OrigamiSayiKatlari.xcodeproj \
+            -scheme OrigamiSayiKatlari \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/OrigamiSayiKatlari.xcarchive \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
+            archive
+
+      - name: Export & upload to TestFlight
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -e
+          cat > ExportOptions.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>app-store-connect</string>
+              <key>destination</key>
+              <string>upload</string>
+              <key>teamID</key>
+              <string>R6W7XU4TM7</string>
+              <key>signingStyle</key>
+              <string>automatic</string>
+          </dict>
+          </plist>
+          EOF
+
+          xcodebuild -exportArchive \
+            -archivePath build/OrigamiSayiKatlari.xcarchive \
+            -exportPath build/export \
+            -exportOptionsPlist ExportOptions.plist \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+
+      - name: Upload export log (for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: export-logs
+          path: build/export
+          retention-days: 7

@@ -1,0 +1,17 @@
+*.ipa
+*.zip
+.claude/
+*.p8
+*.mobileprovision
+*.cer
+*.p12
+key*.png
+ExportOptions.plist
+.certs_tmp/
+Payload/
+build/
+Generated/
+*.xcodeproj
+DerivedData/
+xcuserdata/
+.DS_Store
