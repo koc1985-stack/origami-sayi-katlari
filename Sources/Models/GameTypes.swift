@@ -45,3 +45,13 @@ struct StripState: Equatable {
     var foldCount: Int
     var undosUsed: Int
 }
+
+/// Bir level/günün bulmacası çözüldüğünde geriye dönen özet — yıldız hesaplama
+/// ve paylaşım kartı için kullanılır.
+struct SolveResult {
+    let levelID: String
+    let resetsUsed: Int
+    let undosUsed: Int
+    /// Oyuncunun gerçekte kattığı sıradaki operatörler (paylaşım kartındaki renkli kareler).
+    let foldOrder: [GameOperator]
+}

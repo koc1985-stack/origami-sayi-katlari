@@ -1,29 +1,14 @@
 import SwiftUI
 
 struct RootView: View {
-    @State private var selectedIndex: Int?
-
     var body: some View {
-        Group {
-            if let selectedIndex {
-                GameView(
-                    level: Levels.all[selectedIndex],
-                    levelNumber: selectedIndex + 1,
-                    totalLevels: Levels.all.count,
-                    onExit: { self.selectedIndex = nil },
-                    onNextLevel: {
-                        if selectedIndex + 1 < Levels.all.count {
-                            self.selectedIndex = selectedIndex + 1
-                        }
-                    },
-                    hasNextLevel: selectedIndex + 1 < Levels.all.count
-                )
-            } else {
-                LevelSelectView(levels: Levels.all) { index in
-                    selectedIndex = index
-                }
-            }
+        TabView {
+            LevelsTabView()
+                .tabItem { Label("Levellar", systemImage: "square.grid.3x3.fill") }
+
+            DailyPuzzleView()
+                .tabItem { Label("Günün Bulmacası", systemImage: "calendar") }
         }
-        .background(Color(hex: 0xFAF3E0).ignoresSafeArea())
+        .tint(Color(hex: 0xE0A62E))
     }
 }

@@ -2,53 +2,54 @@ import SwiftUI
 
 struct GameView: View {
     let level: LevelDef
-    let levelNumber: Int
-    let totalLevels: Int
+    /// Level modunda "Level X / Y" başlığı; günün bulmacasında nil.
+    let levelNumber: Int?
+    let totalLevels: Int?
+    /// Level modunda "‹ Levellar" geri dönüşü; günün bulmacasında gizli (sekme çubuğu var).
+    let showExitButton: Bool
     let onExit: () -> Void
-    let onNextLevel: () -> Void
+    let onNextLevel: (() -> Void)?
     let hasNextLevel: Bool
+    let onSolved: (SolveResult) -> Void
 
     @State private var strip: StripState
     @State private var history: [StripState] = []
-    @State private var failedAttempt = false
+    @State private var foldOrder: [GameOperator] = []
+    @State private var resetsUsed = 0
+    @State private var statusMessage: String?
+    @State private var hasReportedSolve = false
+    @State private var hintedCreaseIndex: Int?
+    @State private var shakeTrigger = 0
+    @State private var pulseID: UUID?
 
     init(
         level: LevelDef,
-        levelNumber: Int,
-        totalLevels: Int,
-        onExit: @escaping () -> Void,
-        onNextLevel: @escaping () -> Void,
-        hasNextLevel: Bool
+        levelNumber: Int? = nil,
+        totalLevels: Int? = nil,
+        showExitButton: Bool = true,
+        onExit: @escaping () -> Void = {},
+        onNextLevel: (() -> Void)? = nil,
+        hasNextLevel: Bool = false,
+        onSolved: @escaping (SolveResult) -> Void
     ) {
         self.level = level
         self.levelNumber = levelNumber
         self.totalLevels = totalLevels
+        self.showExitButton = showExitButton
         self.onExit = onExit
         self.onNextLevel = onNextLevel
         self.hasNextLevel = hasNextLevel
+        self.onSolved = onSolved
         _strip = State(initialValue: FoldEngine.createStrip(from: level))
     }
 
     private var finished: Bool { FoldEngine.isFinished(strip) }
     private var won: Bool { finished && FoldEngine.isSolved(strip, target: level.target) }
 
-    private var progressLabel: String { "Level \(levelNumber) / \(totalLevels)" }
-
     var body: some View {
         ZStack {
             VStack(spacing: 0) {
-                HStack {
-                    Button(action: onExit) {
-                        Text("‹ Levellar")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundColor(Color(hex: 0x7A5A2E))
-                    }
-                    Spacer()
-                    Text(progressLabel)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(Color(hex: 0xA0895A))
-                }
-                .padding(.bottom, 16)
+                header
 
                 VStack(spacing: 0) {
                     Text("HEDEF")
@@ -56,53 +57,30 @@ struct GameView: View {
                         .tracking(2)
                         .foregroundColor(Color(hex: 0xA0895A))
                     Text("\(level.target)")
-                        .font(.system(size: 44, weight: .heavy))
+                        .font(.system(size: 44, weight: .heavy, design: .rounded))
                         .foregroundColor(Color(hex: 0x4A3B22))
                 }
                 .padding(.bottom, 28)
 
-                FlowStripView(strip: strip, finished: finished, onFold: handleFold)
-                    .frame(minHeight: 160)
-
-                HStack(spacing: 12) {
-                    Button(action: handleUndo) {
-                        Text("Geri Al")
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundColor(Color(hex: 0x7A5A2E))
-                            .padding(.vertical, 10)
-                            .padding(.horizontal, 18)
-                            .background(Color.white)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .stroke(Color(hex: 0xE4C687), lineWidth: 2)
-                            )
-                            .cornerRadius(12)
+                ZStack {
+                    if let pulseID {
+                        FoldPulseView(color: Color(hex: 0xE0A62E))
+                            .id(pulseID)
                     }
-                    .disabled(history.isEmpty)
-                    .opacity(history.isEmpty ? 0.4 : 1)
-
-                    Button(action: handleReset) {
-                        Text("Baştan")
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundColor(Color(hex: 0x7A5A2E))
-                            .padding(.vertical, 10)
-                            .padding(.horizontal, 18)
-                            .background(Color.white)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .stroke(Color(hex: 0xE4C687), lineWidth: 2)
-                            )
-                            .cornerRadius(12)
-                    }
+                    FlowStripView(strip: strip, finished: finished, hintedCreaseIndex: hintedCreaseIndex, onFold: handleFold)
                 }
-                .padding(.top, 24)
+                .frame(minHeight: 160)
+                .modifier(ShakeEffect(shakes: CGFloat(shakeTrigger)))
 
-                if failedAttempt, !won, let first = strip.cells.first {
-                    Text("Bu sırayla \(first.value) çıktı, hedef \(level.target). Baştan al, farklı bir sırayla katla.")
+                controls
+
+                if let statusMessage, !won {
+                    Text(statusMessage)
                         .font(.system(size: 14))
                         .foregroundColor(Color(hex: 0xA0522D))
                         .multilineTextAlignment(.center)
                         .padding(.top, 20)
+                        .transition(.opacity)
                 }
 
                 Spacer()
@@ -110,7 +88,12 @@ struct GameView: View {
             .padding(.horizontal, 20)
             .padding(.top, 60)
 
+            if statusMessage != nil, !won {
+                Color.red.opacity(0.06).ignoresSafeArea().allowsHitTesting(false)
+            }
+
             if won {
+                ConfettiView()
                 VStack(spacing: 0) {
                     Spacer()
                     winOverlay
@@ -120,12 +103,59 @@ struct GameView: View {
             }
         }
         .background(Color(hex: 0xFAF3E0).ignoresSafeArea())
+        .onChange(of: won) { _, isWon in
+            guard isWon, !hasReportedSolve else { return }
+            hasReportedSolve = true
+            Haptics.success()
+            onSolved(SolveResult(levelID: level.id, resetsUsed: resetsUsed, undosUsed: strip.undosUsed, foldOrder: foldOrder))
+        }
+    }
+
+    private var header: some View {
+        HStack {
+            if showExitButton {
+                Button(action: onExit) {
+                    Text("‹ Levellar")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundColor(Color(hex: 0x7A5A2E))
+                }
+            } else {
+                Color.clear.frame(width: 1, height: 1)
+            }
+            Spacer()
+            if let levelNumber, let totalLevels {
+                Text("Level \(levelNumber) / \(totalLevels)")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(Color(hex: 0xA0895A))
+            } else {
+                Text("Günün Bulmacası")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(Color(hex: 0xA0895A))
+            }
+            Spacer()
+            Button(action: handleHint) {
+                Image(systemName: "lightbulb.fill")
+                    .font(.system(size: 16))
+                    .foregroundColor(Color(hex: 0xE0A62E))
+            }
+            .opacity(finished ? 0.3 : 1)
+            .disabled(finished)
+        }
+        .padding(.bottom, 16)
+    }
+
+    private var controls: some View {
+        HStack(spacing: 12) {
+            PillButton(title: "Geri Al", disabled: history.isEmpty, action: handleUndo)
+            PillButton(title: "Baştan", action: handleReset)
+        }
+        .padding(.top, 24)
     }
 
     private var winOverlay: some View {
         VStack(spacing: 0) {
             Text("Doğru sıra buydu!")
-                .font(.system(size: 20, weight: .heavy))
+                .font(.system(size: 20, weight: .heavy, design: .rounded))
                 .foregroundColor(Color(hex: 0x4A3B22))
                 .padding(.bottom, 4)
             Text("\(level.target) sayısına ulaştın.")
@@ -133,20 +163,8 @@ struct GameView: View {
                 .foregroundColor(Color(hex: 0x7A5A2E))
                 .padding(.bottom, 16)
             HStack(spacing: 12) {
-                Button(action: handleReset) {
-                    Text("Tekrar Oyna")
-                        .font(.system(size: 14, weight: .bold))
-                        .foregroundColor(Color(hex: 0x7A5A2E))
-                        .padding(.vertical, 10)
-                        .padding(.horizontal, 18)
-                        .background(Color.white)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(Color(hex: 0xE4C687), lineWidth: 2)
-                        )
-                        .cornerRadius(12)
-                }
-                if hasNextLevel {
+                PillButton(title: "Tekrar Oyna", action: handleReset)
+                if hasNextLevel, let onNextLevel {
                     Button(action: onNextLevel) {
                         Text("Sonraki Level ›")
                             .font(.system(size: 14, weight: .bold))
@@ -167,38 +185,67 @@ struct GameView: View {
         )
         .cornerRadius(20)
         .shadow(color: .black.opacity(0.15), radius: 8, x: 0, y: 4)
+        .transition(.scale.combined(with: .opacity))
     }
 
     private func animateAndSet(_ next: StripState) {
-        withAnimation(.spring(response: 0.4, dampingFraction: 0.75)) {
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.72)) {
             strip = next
         }
     }
 
     private func handleFold(_ creaseIndex: Int) {
         guard !finished else { return }
+        Haptics.fold()
         history.append(strip)
-        failedAttempt = false
+        foldOrder.append(strip.creases[creaseIndex].op)
+        statusMessage = nil
+        hintedCreaseIndex = nil
+        pulseID = UUID()
         let next = FoldEngine.foldAt(strip, creaseIndex: creaseIndex)
         animateAndSet(next)
         if next.cells.count == 1 && next.cells[0].value != level.target {
-            failedAttempt = true
+            statusMessage = "Bu sırayla \(next.cells[0].value) çıktı, hedef \(level.target). Baştan al, farklı bir sırayla katla."
+            Haptics.failure()
+            withAnimation(.default) { shakeTrigger += 1 }
         }
     }
 
     private func handleUndo() {
         guard let previous = history.last else { return }
+        Haptics.tap()
         history.removeLast()
-        failedAttempt = false
+        foldOrder.removeLast()
+        statusMessage = nil
+        hintedCreaseIndex = nil
         var restored = previous
         restored.undosUsed += 1
         animateAndSet(restored)
     }
 
     private func handleReset() {
+        Haptics.tap()
+        if !won {
+            resetsUsed += 1
+        }
         history = []
-        failedAttempt = false
+        foldOrder = []
+        statusMessage = nil
+        hasReportedSolve = false
+        hintedCreaseIndex = nil
         animateAndSet(FoldEngine.createStrip(from: level))
+    }
+
+    private func handleHint() {
+        guard !finished else { return }
+        Haptics.tap()
+        let hint = Solver.hintCreaseIndex(state: strip, target: level.target)
+        withAnimation { hintedCreaseIndex = hint }
+        if hint == nil {
+            statusMessage = "Bu yoldan hedefe ulaşılamıyor. Baştan al, farklı bir sırayla dene."
+            Haptics.failure()
+            withAnimation(.default) { shakeTrigger += 1 }
+        }
     }
 }
 
@@ -207,14 +254,15 @@ struct GameView: View {
 private struct FlowStripView: View {
     let strip: StripState
     let finished: Bool
+    let hintedCreaseIndex: Int?
     let onFold: (Int) -> Void
 
     var body: some View {
         FlowLayout(spacing: 12) {
             ForEach(Array(strip.cells.enumerated()), id: \.element.id) { index, cell in
-                CellView(value: cell.value, highlighted: finished)
+                CellView(value: cell.value, highlighted: finished, justMerged: cell.id.hasPrefix("m-"))
                 if index < strip.creases.count {
-                    CreaseButtonView(op: strip.creases[index].op) {
+                    CreaseButtonView(op: strip.creases[index].op, hinted: hintedCreaseIndex == index) {
                         onFold(index)
                     }
                 }
@@ -264,5 +312,43 @@ private struct FlowLayout: Layout {
             x += size.width + spacing
             rowHeight = max(rowHeight, size.height)
         }
+    }
+}
+
+private struct PillButton: View {
+    let title: String
+    var disabled: Bool = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 14, weight: .bold, design: .rounded))
+                .foregroundColor(Color(hex: 0x7A5A2E))
+                .padding(.vertical, 10)
+                .padding(.horizontal, 18)
+                .background(Color.white)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(Color(hex: 0xE4C687), lineWidth: 2)
+                )
+                .cornerRadius(12)
+        }
+        .disabled(disabled)
+        .opacity(disabled ? 0.4 : 1)
+    }
+}
+
+/// Yanlış sonuçta şeridi hafifçe salla — "hayır, bu değil" hissi.
+private struct ShakeEffect: GeometryEffect {
+    var shakes: CGFloat
+    var animatableData: CGFloat {
+        get { shakes }
+        set { shakes = newValue }
+    }
+
+    func effectValue(size: CGSize) -> ProjectionTransform {
+        let offset = sin(shakes * .pi * 6) * 6
+        return ProjectionTransform(CGAffineTransform(translationX: offset, y: 0))
     }
 }
